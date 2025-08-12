@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <link rel="icon" type="image/x-icon" href="assets/bobicon.ico">
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>BigBob — Deal Catcher (Show-All + Growth + Flash Voice)</title>
+<style>
+  :root { --cw: 1200; --ch: 675; --uiH: 56px; }
+  html, body { height:100%; margin:0; background:#000; color:#e9ecf1; font-family: Inter, system-ui, Arial, sans-serif; overflow:hidden; }
+  .app { height:100%; display:grid; grid-template-rows: var(--uiH) 1fr; }
+  .ui { height:var(--uiH); display:flex; align-items:center; justify-content:space-between; gap:8px; padding:0 12px; background:#0e0f13; }
+  .left, .right { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  button.btn { background:#2a3144; border:1px solid #3f4760; color:#e9ecf1; padding:8px 14px; border-radius:10px; cursor:pointer; }
+  .pill { padding:6px 10px; border-radius:999px; background:#1f2636; border:1px solid #36405a; }
+  .stage { position:relative; height:100%; width:100%; display:flex; align-items:center; justify-content:center; background:#000; }
+  canvas { border:2px solid #fff; image-rendering: pixelated; background:#69c7ff; }
+  .note { opacity:.85; font-size:14px; }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="ui">
+    <div class="left">
+      <button id="muteBtn" class="btn">Mute</button>
+      <button id="startBtn" class="btn">Start</button>
+    </div>
+    <div class="right">
+      <span id="hud" class="pill">Score: $0 · Time: 60s</span>
+      <span class="note">←/→ move · Space/↑ jump · R restart · M mute · 1/2 ground ±2px</span>
+    </div>
+  </div>
+  <div class="stage">
+    <canvas id="game" width="1200" height="675"></canvas>
+  </div>
+</div>
+
+<script>
+(() => {
+  // ----- Show-all scaling (no stretch, no scroll) -----
+  const baseW = 1200, baseH = 675;
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  function fit() {
+    const uiH = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--uiH')) || 56;
+    const availW = window.innerWidth - 24; // small padding
+    const availH = window.innerHeight - uiH - 24;
+    const scale = Math.min(availW / baseW, availH / baseH);
+    const cssW = Math.floor(baseW * scale);
+    const cssH = Math.floor(baseH * scale);
+    canvas.style.width = cssW + 'px';
+    canvas.style.height = cssH + 'px';
+  }
+  addEventListener('resize', fit); fit();
+
+  const W = canvas.width, H = canvas.height; // internal, never changes
+  const HUD = document.getElementById('hud');
+  const muteBtn = document.getElementById('muteBtn');
+
+  // ----- Physics & timing -----
+  let GROUND_Y = H - 86;              // top of green strip (below bottom yellow line)
+  const GRAVITY = 0.6;
+  const MAX_RUN = 7;
+  const ACCEL = 0.8;
+  const FRICTION = 0.75;
+  const JUMP_VEL = 13.5;
+  const ROUND_LEN = 60;
+  const BILL_INTERVAL_MULT = 1.33;    // 25% fewer bills
+
+  // Nudge ground for micro-tuning
+  addEventListener('keydown', e => {
+    if (e.code === 'Digit1') GROUND_Y -= 2;
+    if (e.code === 'Digit2') GROUND_Y += 2;
+  });
+
+  // ----- Assets (external files next to HTML) -----
+  const bgImg   = new Image(); bgImg.src   = 'assets/NewBackround.png';
+  const walk1   = new Image(); walk1.src   = 'assets/BBWalk1.png';
+  const walk2   = new Image(); walk2.src   = 'assets/BBWalk2.png';
+  const jumpImg = new Image(); jumpImg.src = 'assets/BBJUMP.png';
+
+  // Music & voice
+  let music;
+  try { music = new Audio('assets/BobGun_8bit.mp3'); music.loop = true; music.volume = 0.20; } catch(e){}
+  let growVoice;
+  try { growVoice = new Audio('assets/IMBIGBOB_VOICE_FNL.mp3'); } catch(e){}
+
+  let muted = false;
+  function updateMuteUI(){ muteBtn.textContent = muted ? 'Unmute' : 'Mute'; }
+  updateMuteUI();
+  muteBtn.onclick = () => { muted = !muted; if (music) music.muted = muted; if (typeof growVoice !== 'undefined' && growVoice) growVoice.muted = muted; if (growVoice) growVoice.muted = muted; updateMuteUI(); };
+  addEventListener('keydown', e => { if (e.code==='KeyM') muteBtn.click(); });
+
+  // Inputs
+  const keys = new Set();
+  addEventListener('keydown', e => {
+    if (['ArrowLeft','ArrowRight','ArrowUp','Space'].includes(e.code)) e.preventDefault();
+    keys.add(e.code);
+    if (e.code==='Enter') startGame();
+    if (e.code==='KeyR') startGame();
+  });
+  addEventListener('keyup', e => keys.delete(e.code));
+
+  // ----- Player (single growth +40% at $500) -----
+  const player = {
+    x:160, y:GROUND_Y-180, baseW:140, baseH:180,
+    vx:0, vy:0, onGround:true, facing:1, animTime:0, scale:1, grew:false
+  };
+  function pW() { return player.baseW * player.scale; }
+  function pH() { return player.baseH * player.scale; }
+  function playerHitbox() {
+    // shrink hitbox ~15% each side; a bit more after growth to keep fairness
+    const shrink = player.scale > 1 ? 0.2 : 0.15;
+    const w = pW(), h = pH();
+    const insetX = w * shrink, insetY = h * shrink;
+    return { x: player.x + insetX/2, y: player.y + insetY/2, w: w - insetX, h: h - insetY };
+  }
+
+  // World & camera
+  let worldW = W;
+  let cameraX = 0;
+  bgImg.onload = () => { worldW = Math.floor(bgImg.width * (H / bgImg.height)); };
+
+  // Entities
+  const bills = []; let spawnCooldown = 0;
+  const tires = []; let tireCooldown = 0;
+
+  // Round state
+  let running=false, timeLeft=ROUND_LEN, money=0, hitFlashTime=0, endBanner='';
+  let playerFlashTime = 0; // retro power-up flash timer
+
+  // SFX
+  const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  function beep(freq=880, dur=0.08, type='square', vol=0.03){
+    if (muted) return;
+    const t = audioCtx.currentTime;
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.type = type; o.frequency.setValueAtTime(freq, t);
+    g.gain.setValueAtTime(vol, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g).connect(audioCtx.destination);
+    o.start(t); o.stop(t + dur);
+  }
+  function hitSound(){ beep(180,0.08,'square',0.06); beep(140,0.14,'triangle',0.05); }
+
+  document.getElementById('startBtn').onclick = startGame;
+  function startGame(){
+    running = true; timeLeft = ROUND_LEN; money = 0; endBanner='';
+    bills.length=0; tires.length=0; spawnCooldown=0; tireCooldown=0; hitFlashTime=0; playerFlashTime=0;
+    player.vx=0; player.vy=0; player.onGround=true; player.facing=1; player.animTime=0; player.scale=1; player.grew=false;
+    player.x = 160; player.y = GROUND_Y - pH();
+    cameraX = 0;
+    HUD.textContent = 'Score: $0 · Time: ' + timeLeft + 's';
+    try { if (music) { music.currentTime = 0; music.muted = muted; music.play().catch(()=>{}); } if (typeof growVoice !== 'undefined' && growVoice) { growVoice.muted = muted; } } catch(e){}
+  }
+
+  function clamp(v,a,b){ return Math.max(a, Math.min(b,v)); }
+  function rectHit(ax,ay,aw,ah,bx,by,bw,bh){ return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by; }
+  function circleRectHit(cx,cy,r, rx,ry,rw,rh){
+    const nx = Math.max(rx, Math.min(cx, rx+rw));
+    const ny = Math.max(ry, Math.min(cy, ry+rh));
+    const dx = cx - nx, dy = cy - ny;
+    return dx*dx + dy*dy <= r*r;
+  }
+
+  function update(dt){
+    if (!running) return;
+    timeLeft -= dt;
+    if (timeLeft <= 0){
+      running = false;
+      endBanner = (money >= 2000) ? 'GREAT DEAL' : (money >= 1000) ? 'GOOD DEAL' : 'NO DEAL';
+      beep(330,0.25,'triangle',0.05); beep(220,0.35,'sine',0.05);
+    }
+
+    const left = keys.has('ArrowLeft');
+    const right = keys.has('ArrowRight');
+    const jumpPressed = keys.has('Space') || keys.has('ArrowUp');
+
+    if (left)  player.vx = Math.max(player.vx - ACCEL, -MAX_RUN);
+    if (right) player.vx = Math.min(player.vx + ACCEL,  MAX_RUN);
+    if (!left && !right) player.vx *= FRICTION;
+
+    if (jumpPressed && player.onGround){ player.vy = -JUMP_VEL; player.onGround=false; beep(660,0.1); }
+
+    player.vy += GRAVITY;
+    player.x += player.vx; player.y += player.vy;
+
+    if (player.y + pH() >= GROUND_Y){ player.y = GROUND_Y - pH(); player.vy = 0; player.onGround = true; }
+
+    if (player.vx > 0.2) player.facing = 1; else if (player.vx < -0.2) player.facing = -1;
+    player.animTime += Math.abs(player.vx)*dt*8 + (!player.onGround ? dt*6 : 0);
+
+    const camTarget = clamp(player.x - W*0.45, 0, Math.max(0, worldW - W));
+    cameraX += (camTarget - cameraX) * 0.15;
+    player.x = clamp(player.x, 0, worldW - pW());
+
+    // Spawn $20 bills (25% fewer)
+    spawnCooldown -= dt;
+    if (spawnCooldown <= 0){
+      const rate = Math.max(0.35, 1.0 - (ROUND_LEN - timeLeft) / ROUND_LEN);
+      spawnCooldown = 0.35 * rate * BILL_INTERVAL_MULT;
+      const spawnX = cameraX + Math.random()*W;
+      bills.push({ x: spawnX, y: -60, w: 28, h: 14, vy: 1 + Math.random()*0.8 });
+    }
+
+    for (let i=bills.length-1; i>=0; i--){
+      const b = bills[i];
+      const depth = Math.min(1, Math.max(0, (b.y + 40) / (GROUND_Y - 40)));
+      b.vy += GRAVITY * (0.2 + depth*1.2) * dt * 60 / 60;
+      b.y += b.vy;
+      const hb = playerHitbox();
+      if (rectHit(hb.x, hb.y, hb.w, hb.h, b.x, b.y, b.w, b.h)){
+        money += 20;
+        if (!player.grew && money >= 500){
+          const oldH = pH();
+          player.scale = 1.4; // +40%
+          player.grew = true;
+          const newH = pH();
+          player.y -= (newH - oldH); // keep feet planted
+          // Flash & voice
+          playerFlashTime = 0.6; // ~0.6s
+          try { if (growVoice) { growVoice.currentTime = 0; growVoice.muted = muted; growVoice.play().catch(()=>{}); } } catch(e){}
+        }
+        beep(880,0.08); beep(1320,0.06);
+        bills.splice(i,1); continue;
+      }
+      if (b.y > GROUND_Y - 8) bills.splice(i,1);
+    }
+
+    // Tires every 10s, 50% slower vx
+    tireCooldown -= dt;
+    if (tireCooldown <= 0){
+      tireCooldown = 10.0;
+      const r = 22;
+      tires.push({ cx: cameraX + W + r + 10, cy: GROUND_Y - r, r, vx: -3.1, rot: 0 });
+    }
+    for (let i=tires.length-1; i>=0; i--){
+      const t = tires[i];
+      t.cx += t.vx; t.cy = GROUND_Y - t.r; t.rot += 0.18 * Math.sign(t.vx);
+      const hb = playerHitbox();
+      if (circleRectHit(t.cx, t.cy, t.r*0.9, hb.x, hb.y, hb.w, hb.h)){
+        money = 0; player.scale = 1; player.grew = false; player.y = GROUND_Y - pH();
+        hitFlashTime = 0.25; 
+        // stop flash if active
+        playerFlashTime = 0;
+        try { if (growVoice) growVoice.pause(); } catch(e){}
+        hitSound(); tires.splice(i,1); continue;
+      }
+      if (t.cx < cameraX - 200) tires.splice(i,1);
+    }
+
+    if (hitFlashTime > 0) hitFlashTime -= dt;
+    if (playerFlashTime > 0) playerFlashTime -= dt;
+
+    HUD.textContent = `Score: $${money} · Time: ${Math.max(0, Math.ceil(timeLeft))}s`;
+  }
+
+  function draw(){
+    // Background
+    ctx.fillStyle = '#000'; ctx.fillRect(0,0,baseW,baseH);
+    if (bgImg.complete){
+      const scale = H / bgImg.height;
+      const sx = cameraX / scale;
+      const sw = W / scale;
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(bgImg, sx, 0, sw, bgImg.height, 0, 0, W, H);
+    }
+
+    // Bills
+    bills.forEach(b => {
+      const x = Math.round(b.x - cameraX), y = Math.round(b.y);
+      ctx.fillStyle = '#1d7f3b'; ctx.fillRect(x, y, b.w, b.h);
+      ctx.fillStyle = '#c7f1cf'; ctx.fillRect(x+6, y+4, b.w-12, b.h-8);
+      ctx.fillStyle = '#1d7f3b'; ctx.fillRect(x+10, y+6, 8, b.h-12);
+      ctx.fillStyle = '#0b4d23'; ctx.font = '10px monospace'; ctx.fillText('20', x+3, y+11);
+    });
+
+    // Tires
+    tires.forEach(t => {
+      const x = Math.round(t.cx - cameraX), y = Math.round(t.cy);
+      ctx.fillStyle = '#222'; ctx.beginPath(); ctx.arc(x, y, t.r, 0, Math.PI*2); ctx.fill();
+      ctx.fillStyle = '#555'; ctx.beginPath(); ctx.arc(x, y, t.r*0.6, 0, Math.PI*2); ctx.fill();
+      ctx.save(); ctx.translate(x, y); ctx.rotate(t.rot);
+      ctx.fillStyle = '#777'; for (let i=0;i<6;i++) { ctx.fillRect(-t.r+4 + i*7, -3, 4, 6); } ctx.restore();
+    });
+
+    // Player
+    const px = Math.round(player.x - cameraX);
+    const py = Math.round(player.y + Math.sin(player.animTime*8) * (player.onGround ? 2 : 0));
+    ctx.save();
+    ctx.translate(px + (player.facing===-1 ? pW() : 0), py);
+    ctx.scale(player.facing, 1);
+    ctx.imageSmoothingEnabled = false;
+
+    let img = walk1;
+    if (!player.onGround && jumpImg.width>0) img = jumpImg;
+    else if (walk2.width>0) img = (Math.floor(player.animTime*6)%2===0) ? walk1 : walk2;
+
+    const aspect = (img.width||1)/(img.height||1);
+    let dw = pW(), dh = dw/aspect;
+    if (dh > pH()) { dh = pH(); dw = dh*aspect; }
+    // Flash effect: skip drawing on alternate frames during flash
+    const flashing = playerFlashTime > 0 && (Math.floor(playerFlashTime * 18) % 2) === 0;
+    if (!flashing) {
+      ctx.drawImage(img, 0, 0, img.width||1, img.height||1, (pW()-dw)/2, pH()-dh, dw, dh);
+    }
+    ctx.restore();
+
+    // Hit flash
+    if (hitFlashTime > 0){ const a = Math.min(0.35, hitFlashTime*1.2); ctx.fillStyle = `rgba(255,60,60,${a})`; ctx.fillRect(0,0,W,H); }
+
+    // End screen with deal label and dynamic width
+    if (!running && timeLeft <= 0){
+      const label = (money >= 2000) ? 'GREAT DEAL' : (money >= 1000) ? 'GOOD DEAL' : 'NO DEAL';
+      const line1 = label;
+      const line2 = `You caught $${money}. Press R to play again.`;
+      ctx.font = 'bold 36px monospace';
+      const w1 = ctx.measureText(line1).width;
+      ctx.font = 'bold 20px monospace';
+      const w2 = ctx.measureText(line2).width;
+      const bw = Math.max(520, Math.ceil(Math.max(w1, w2)) + 80);
+      const bh = 160;
+      const bx = (W - bw) / 2, by = H/2 - bh/2;
+      ctx.save();
+      ctx.globalAlpha = 0.9; ctx.fillStyle = '#0e0f13cc'; ctx.fillRect(bx, by, bw, bh);
+      ctx.globalAlpha = 1; ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 3; ctx.strokeRect(bx, by, bw, bh);
+      ctx.fillStyle = '#ffffff'; ctx.font = 'bold 36px monospace'; ctx.textAlign='center';
+      ctx.fillText(line1, W/2, by + 70);
+      ctx.font = 'bold 20px monospace'; ctx.fillText(line2, W/2, by + 108);
+      ctx.restore();
+    }
+  }
+
+  // Game loop
+  let last = performance.now();
+  function loop(now){
+    const dt = Math.min(0.05, (now - last)/1000);
+    last = now;
+    update(dt);
+    draw();
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
